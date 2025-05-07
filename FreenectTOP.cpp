@@ -22,14 +22,18 @@ static constexpr int HEIGHT = 480;
 // MyFreenectDevice ---------------------------------------------------------
 MyFreenectDevice::MyFreenectDevice(freenect_context* ctx, int index,
                                    std::atomic<bool>& rgbFlag,
-                                   std::atomic<bool>& depthFlag)
+                                   std::atomic<bool>& depthFlag,
+                                   std::atomic<bool>& irFlag)
   : FreenectDevice(ctx, index)
   , rgbReady(rgbFlag)
   , depthReady(depthFlag)
+  , irReady(irFlag)
   , rgbBuffer(WIDTH*HEIGHT*3)
   , depthBuffer(WIDTH*HEIGHT)
+  , irBuffer(WIDTH*HEIGHT)
   , hasNewRGB(false)
   , hasNewDepth(false)
+  , hasNewIR(false)
 {
     setVideoFormat(FREENECT_VIDEO_RGB);
     setDepthFormat(FREENECT_DEPTH_11BIT);
@@ -53,6 +57,15 @@ void MyFreenectDevice::DepthCallback(void* depth, uint32_t) {
     depthReady = true;
 }
 
+void MyFreenectDevice::IRCallback(void* ir, uint32_t) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!ir) return;
+    auto ptr = static_cast<uint8_t*>(ir);
+    std::copy(ptr, ptr + irBuffer.size(), irBuffer.begin());
+    hasNewIR = true;
+    irReady = true;
+}
+
 bool MyFreenectDevice::getRGB(std::vector<uint8_t>& out) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!hasNewRGB) return false;
@@ -66,6 +79,14 @@ bool MyFreenectDevice::getDepth(std::vector<uint16_t>& out) {
     if (!hasNewDepth) return false;
     out = depthBuffer;
     hasNewDepth = false;
+    return true;
+}
+
+bool MyFreenectDevice::getIR(std::vector<uint8_t>& out) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!hasNewIR) return false;
+    out = irBuffer;
+    hasNewIR = false;
     return true;
 }
 
@@ -135,8 +156,10 @@ bool FreenectTOP::initDevice() {
     try {
         firstRGBReady = false;
         firstDepthReady = false;
+        firstIRReady = false;
 
-        device = new MyFreenectDevice(freenectContext, 0, firstRGBReady, firstDepthReady);
+        device = new MyFreenectDevice(freenectContext, 0, firstRGBReady, firstDepthReady, firstIRReady);
+        device->setVideoFormat(FREENECT_VIDEO_IR_8BIT);
         device->startVideo();
         device->startDepth();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -164,8 +187,8 @@ bool FreenectTOP::initDevice() {
 
 FreenectTOP::FreenectTOP(const OP_NodeInfo* info, TOP_Context* context)
     : myNodeInfo(info), myContext(context), freenectContext(nullptr), device(nullptr),
-      firstRGBReady(false), firstDepthReady(false),
-      lastRGB(WIDTH*HEIGHT*3, 0), lastDepth(WIDTH*HEIGHT, 0) {
+      firstRGBReady(false), firstDepthReady(false), firstIRReady(false),
+      lastRGB(WIDTH*HEIGHT*3, 0), lastDepth(WIDTH*HEIGHT, 0), lastIR(WIDTH*HEIGHT, 0) {
     initDevice();
 }
 
@@ -195,6 +218,14 @@ void FreenectTOP::setupParameters(OP_ParameterManager* manager, void*) {
     invertParam.clampMins[0]     = true;
     invertParam.clampMaxes[0]    = true;
     manager->appendToggle(invertParam);
+
+    // Video Mode menu: RGB or IR
+    OP_StringParameter vm("VideoMode");
+    vm.label        = "Video Mode";
+    vm.defaultValue = "RGB";
+    static const char* menuNames[]  = { "RGB", "IR" };
+    static const char* menuLabels[] = { "RGB", "IR" };
+    manager->appendMenu(vm, 2, menuNames, menuLabels);
 }
 
 void FreenectTOP::getGeneralInfo(TOP_GeneralInfo* ginfo, const OP_Inputs*, void*) {
@@ -202,6 +233,7 @@ void FreenectTOP::getGeneralInfo(TOP_GeneralInfo* ginfo, const OP_Inputs*, void*
 }
 
 void FreenectTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*) {
+    std::string mode = inputs->getParString("VideoMode");
     bool deviceValid = (device != nullptr);
     if (!device) {
         cleanupDevice();
@@ -315,6 +347,33 @@ void FreenectTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*) {
         info.textureDesc.pixelFormat = OP_PixelFormat::Mono16Fixed;
         info.colorBufferIndex        = 1;
         output->uploadBuffer(&buf, info, nullptr);
+    }
+
+    if (mode == "IR") {
+        std::vector<uint8_t> ir;
+        if (device->getIR(ir)) {
+            lastIR = ir;
+            OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(WIDTH*HEIGHT*4, TOP_BufferFlags::None, nullptr);
+            uint8_t* out = static_cast<uint8_t*>(buf->data);
+            for (int y = 0; y < HEIGHT; ++y)
+                for (int x = 0; x < WIDTH; ++x) {
+                    int srcY = HEIGHT - 1 - y;
+                    int iSrc = (srcY * WIDTH + x);
+                    int iDst = (y * WIDTH + x) * 4;
+                    uint8_t v = lastIR[iSrc];
+                    out[iDst+0] = v;
+                    out[iDst+1] = v;
+                    out[iDst+2] = v;
+                    out[iDst+3] = 255;
+                }
+            TOP_UploadInfo info;
+            info.textureDesc.width       = WIDTH;
+            info.textureDesc.height      = HEIGHT;
+            info.textureDesc.texDim      = OP_TexDim::e2D;
+            info.textureDesc.pixelFormat = OP_PixelFormat::RGBA8Fixed;
+            info.colorBufferIndex        = 2;
+            output->uploadBuffer(&buf, info, nullptr);
+        }
     }
 }
 
